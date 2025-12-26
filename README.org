@@ -6,7 +6,7 @@
 
 Socrates is a minimal viable AI assistant built in Clojure using literate programming.
 It acts as a Personal Data Assistant (PDA) with access to your Emacs knowledge base
-through clomacs integration.
+through clomacs integration. (This project is the product of me testing LLMs, I do not recommend running this.)
 
 * Features
 
@@ -65,8 +65,3 @@ See =socrates.org= for complete architecture documentation.
 - TDD + TCR hybrid approach
 - Comprehensive documentation alongside code
 - Self-documenting tests with full context
-
-* License
-
-Open source - use as you wish.
-
