@@ -1,0 +1,18 @@
+{:ollama {:endpoint "http://localhost:11434"
+          :model "llama3.2"
+          :timeout 30000}
+ :whisper {:model-size "tiny"
+           :model-path "/usr/local/bin/whisper.cpp"}
+ :speech {:wake-word "socrates"
+          :sensitivity 0.5}
+ :rag {:paths ["/home/kesh/Documents"]
+       :chunk-size 500
+       :chunk-overlap 50
+       :top-k 5}
+ :mcp {:servers []}
+ :emacs {:connection-type "socket"
+         :socket-path "/tmp/emacs-server"}
+ :storage {:conversations "data/conversations"
+           :index "data/index"
+           :cache "data/cache"}}
+

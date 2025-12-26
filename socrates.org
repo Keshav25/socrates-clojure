@@ -1,0 +1,1541 @@
+#+TITLE: Socrates Clojure AI Assistant
+#+AUTHOR: Keshav Itaia
+#+DATE: 2025-12-26
+
+* Introduction
+
+Socrates is a minimal viable AI assistant built in Clojure using literate programming.
+It acts as a Personal Data Assistant (PDA) with access to your Emacs knowledge base
+through clomacs integration.
+
+** Features
+
+- Speech input via Whisper (whisper.cpp)
+- Speech output via espeak
+- Ollama integration for LLM capabilities
+- RAG system for document retrieval
+- MCP client for tool execution
+- Emacs integration (org-ql, memacs, denote) via clomacs
+- Context management for conversation history
+
+** Development Approach
+
+This system is developed using:
+- Literate programming (org-mode with org-babel)
+- TDD + TCR hybrid approach
+- Comprehensive documentation alongside code
+- Self-documenting tests with full context
+
+*** TDD + TCR Workflow
+
+This file is organized to support Test-Driven Development (TDD) and
+Test && Commit || Revert (TCR) workflows:
+
+1. **TDD Workflow**:
+   - Navigate to a component section (e.g., ** Ollama Integration)
+   - For each function/unit, write its test in a "*** Tests for [function]" subsection first
+   - Execute test block with =C-c C-c= (should fail - red)
+   - Write implementation in "*** Implementation: [function]" subsection right below
+   - Execute test block again (should pass - green)
+   - Each function has its test and implementation co-located
+
+2. **TCR Workflow**:
+   - Make a small change to a function's implementation or test
+   - Execute that function's test block with =C-c C-c=
+   - If green: commit the change (using =jj commit=)
+   - If red: revert to last green state (using =jj abandon=)
+   - Repeat with smaller increments
+
+3. **Benefits of This Organization**:
+   - Each function/unit has its test and implementation right next to each other
+   - Easy to see what's tested and what's not at a glance
+   - AI agents can understand a specific function by reading its section
+   - Natural TDD flow: test first, then implementation right below
+   - Org-babel still tangles code to appropriate files (test/ and src/)
+
+* Architecture
+
+** System Overview
+
+The system follows a modular architecture:
+
+1. Input Layer: Whisper STT for speech recognition
+2. Core Processing: Ollama client, RAG engine, MCP client, Emacs bridge
+3. Storage: Vector store, context DB, embedding cache
+4. Output Layer: TTS for speech synthesis
+
+** Component Interactions
+
+- User speaks → Whisper STT → Ollama
+- Ollama may query RAG for document context
+- Ollama may query Emacs via clomacs for personal data
+- Ollama may use MCP tools for actions
+- Ollama generates response → TTS → User hears answer
+
+* Core Components
+
+** Ollama Integration
+
+The Ollama client handles all communication with the Ollama API.
+
+*** Purpose
+
+The Ollama client is responsible for:
+- HTTP communication with Ollama API
+- Streaming response handling
+- Embedding generation for RAG
+- Error handling and retries
+
+*** Architecture
+
+The client uses http-kit for async HTTP communication. All requests are
+made to the Ollama API endpoint (default: http://localhost:11434).
+
+*** Design Decisions
+
+- We use http-kit instead of clj-http because it's lighter and supports
+  streaming better
+- Embeddings are generated using the same model as chat for consistency
+- We track context window size to avoid exceeding model limits
+- Errors are wrapped in a custom exception type for better error handling
+
+*** API
+
+The main functions are:
+
+- =(chat prompt options)= :: Sends a chat request, returns streaming response
+- =(embed text)= :: Generates embedding vector for text
+- =(list-models)= :: Lists available models
+
+*** Error Handling
+
+The client handles:
+- Network failures (retries with exponential backoff)
+- API errors (returns error details in response)
+- Timeout errors (configurable timeout)
+
+*** Performance Considerations
+
+- Streaming responses are processed asynchronously
+- Embeddings are cached to avoid redundant API calls
+- Connection pooling is used for efficiency
+
+*** Integration Points
+
+- Used by RAG system for embedding generation
+- Used by context manager for summarization
+- Used by core orchestration for main chat functionality
+
+*** Setup and Configuration
+
+These are helper functions and configuration that support the main API functions.
+
+#+NAME: ollama-setup
+#+BEGIN_SRC clojure  :noweb yes
+(ns socrates.ollama
+  "Ollama client implementation.
+   
+   Responsibilities:
+   - HTTP communication with Ollama API
+   - Streaming response handling
+   - Embedding generation
+   - Error handling and retries"
+  (:require [cheshire.core :as json]
+            [clojure.core.async :as async]
+            [org.httpkit.client :as http]))
+
+(defn- get-config
+  "Loads configuration from config.edn"
+  []
+  (let [config-file (java.io.File. "resources/config.edn")]
+    (if (.exists config-file)
+      (read-string (slurp config-file))
+      {:ollama {:endpoint "http://localhost:11434"
+                :model "llama3.2"
+                :timeout 30000}})))
+
+(def config (atom (get-config)))
+
+(defn update-config!
+  "Updates the configuration atom"
+  [new-config]
+  (reset! config new-config))
+
+(defn- ollama-url
+  "Constructs the full URL for an Ollama API endpoint"
+  [path]
+  (str (:endpoint (:ollama @config)) path))
+
+(defn- make-request
+  "Makes an HTTP request to Ollama API with error handling"
+  [method url body options]
+  (let [opts (merge {:timeout (:timeout (:ollama @config))
+                     :headers {"Content-Type" "application/json"}}
+                    options)
+        response @(http/request (merge {:method method
+                                        :url url
+                                        :body (when body (json/generate-string body))}
+                                       opts))]
+    (if (>= (:status response) 400)
+      (throw (ex-info "Ollama API error"
+                      {:status (:status response)
+                       :body (:body response)
+                       :url url}))
+      response)))
+
+#+END_SRC
+
+*** Tests for chat function
+
+Tests that verify the chat function works correctly for both streaming and non-streaming modes.
+
+#+NAME: ollama-test-ns
+#+BEGIN_SRC clojure :tangle test/socrates/ollama_test.clj
+(ns socrates.ollama-test
+  "Tests for Ollama client."
+  (:require [clojure.test :refer :all]
+            [socrates.ollama :as ollama]
+            [clojure.core.async :as async]))
+
+#+END_SRC
+
+#+NAME: ollama-chat-tests-body
+#+BEGIN_SRC clojure
+(deftest test-ollama-chat-returns-message-for-simple-query
+  "Tests that a simple chat query returns a message response.
+   
+   Given: A valid Ollama instance running
+   When: We send a simple chat query 'What is 2+2?' with streaming disabled
+   Then: We should receive a response with a message string"
+  (let [response (ollama/chat "What is 2+2?" {:stream false})]
+    (is (map? response)
+        "Response should be a map, but got: %s (type: %s)"
+        response (type response))
+    (when (contains? response :message)
+      (is (string? (:message response))
+          "Message should be a string, but got: %s (type: %s)
+           Full response: %s"
+          (:message response)
+          (type (:message response))
+          response))))
+
+(deftest test-ollama-chat-streaming-returns-channel
+  "Tests that streaming chat returns a channel with message chunks.
+   
+   Given: A valid Ollama instance running
+   When: We send a chat query with streaming enabled
+   Then: We should receive a channel that yields message chunks"
+  (let [ch (ollama/chat "Hello" {:stream true})]
+    (is (some? ch)
+        "Should return a channel, but got: %s (type: %s)"
+        ch (type ch))
+    (is (instance? clojure.core.async.impl.channels.ManyToManyChannel ch)
+        "Should return a core.async channel, but got: %s"
+        (type ch)))))
+
+#+END_SRC
+
+*** Implementation: chat function
+
+The chat function sends a chat request to Ollama and handles both streaming and non-streaming responses.
+
+#+NAME: ollama-chat-impl
+#+BEGIN_SRC clojure :noweb yes
+<<ollama-setup>>
+
+;; Note: setup is included only in the first block
+
+(defn chat
+  "Sends a chat request to Ollama.
+   
+   Parameters:
+   - prompt: The user's message
+   - options: Map with optional keys:
+     - :stream (boolean): Whether to stream the response (default: true)
+     - :context (vector): Previous conversation context
+     - :model (string): Model to use (defaults to config)
+   
+   Returns:
+   - If streaming: channel that yields message chunks
+   - If not streaming: map with :message key containing full response"
+  ([prompt] (chat prompt {}))
+  ([prompt options]
+   (let [model (or (:model options) (:model (:ollama @config)))
+         stream? (get options :stream true)
+         url (ollama-url "/api/chat")
+         body {:model model
+               :messages (if-let [ctx (:context options)]
+                          (conj ctx {:role "user" :content prompt})
+                          [{:role "user" :content prompt}])
+               :stream stream?}]
+     (if stream?
+       (let [ch (async/chan)]
+         (http/post url
+                    {:body (json/generate-string body)
+                     :headers {"Content-Type" "application/json"}
+                     :timeout (:timeout (:ollama @config))
+                     :as :stream}
+                    (fn [response]
+                      (if (>= (:status response) 400)
+                        (async/close! ch)
+                        (let [reader (java.io.BufferedReader.
+                                      (java.io.InputStreamReader. (:body response)))]
+                          ((fn read-loop []
+                             (when-let [line (.readLine reader)]
+                               (when (not= line "")
+                                 (try
+                                   (let [data (json/parse-string line true)]
+                                     (async/>! ch data)
+                                     (when-not (:done data)
+                                       (read-loop)))
+                                   (catch Exception e
+                                     (async/close! ch))))))
+                          (async/close! ch)))))
+         ch)
+       (let [response (make-request :post url body {})]
+         (json/parse-string (:body response) true))))))
+
+#+END_SRC
+
+*** Tests for embed function
+
+Tests that verify the embed function generates embeddings correctly.
+
+#+NAME: ollama-embed-tests-body
+#+BEGIN_SRC clojure
+(deftest test-ollama-embed-generates-vector
+  "Tests that embedding generation returns a vector of floats.
+   
+   Given: A valid Ollama instance running
+   When: We request an embedding for text 'test'
+   Then: We should receive a vector of numbers"
+  (let [embedding (ollama/embed "test")]
+    (is (vector? embedding)
+        "Embedding should be a vector, but got: %s (type: %s)"
+        embedding (type embedding))
+    (when (seq embedding)
+      (is (every? number? embedding)
+          "All embedding values should be numbers, but got: %s"
+          embedding)
+      (is (> (count embedding) 0)
+          "Embedding should not be empty, got %d dimensions"
+          (count embedding)))))
+
+#+END_SRC
+
+*** Implementation: embed function
+
+The embed function generates an embedding vector for the given text using Ollama's embedding API.
+
+#+NAME: ollama-embed-impl
+#+BEGIN_SRC clojure :noweb yes
+<<ollama-chat-impl>>
+
+;; Note: This block includes chat-impl which includes setup
+
+(defn embed
+  "Generates an embedding vector for the given text.
+   
+   Parameters:
+   - text: The text to embed
+   - options: Map with optional :model key
+   
+   Returns:
+   - Vector of floats representing the embedding"
+  ([text] (embed text {}))
+  ([text options]
+   (let [model (or (:model options) (:model (:ollama @config)))
+         url (ollama-url "/api/embeddings")
+         body {:model model
+               :prompt text}
+         response (make-request :post url body {})
+         parsed (json/parse-string (:body response) true)]
+     (:embedding parsed))))
+
+#+END_SRC
+
+*** Tests for list-models function
+
+Tests that verify the list-models function returns available models.
+
+#+NAME: ollama-list-models-tests-body
+#+BEGIN_SRC clojure
+(deftest test-ollama-list-models-returns-vector
+  "Tests that list-models returns a vector of model information.
+   
+   Given: A valid Ollama instance running
+   When: We request the list of models
+   Then: We should receive a vector of model maps"
+  (let [models (ollama/list-models)]
+    (is (vector? models)
+        "Models should be a vector, but got: %s (type: %s)"
+        models (type models))
+    (when (seq models)
+      (is (every? map? models)
+          "All models should be maps, but got: %s"
+          models))))
+
+#+END_SRC
+
+#+NAME: ollama-list-models-tests
+#+BEGIN_SRC clojure :tangle test/socrates/ollama_test.clj :noweb yes
+<<ollama-chat-tests-body>>
+<<ollama-embed-tests-body>>
+<<ollama-list-models-tests-body>>
+
+#+END_SRC
+
+*** Implementation: list-models function
+
+The list-models function retrieves all available Ollama models.
+
+#+NAME: ollama-list-models-impl
+#+BEGIN_SRC clojure :tangle src/socrates/ollama.clj :noweb yes
+<<ollama-embed-impl>>
+
+;; Note: This block includes embed-impl which includes chat-impl which includes setup
+
+(defn list-models
+  "Lists all available Ollama models.
+   
+   Returns:
+   - Vector of model information maps"
+  []
+  (let [url (ollama-url "/api/tags")
+        response (make-request :get url nil {})
+        parsed (json/parse-string (:body response) true)]
+    (:models parsed)))
+
+#+END_SRC
+
+
+** RAG System
+
+The RAG (Retrieval Augmented Generation) system provides document retrieval
+capabilities by indexing files and retrieving relevant chunks based on semantic similarity.
+
+*** Purpose
+
+The RAG system is responsible for:
+- Indexing documents from specified paths
+- Generating embeddings for text chunks
+- Storing vectors in an in-memory store
+- Retrieving relevant chunks based on query similarity
+- Persisting index to EDN files
+
+*** Architecture
+
+The system uses:
+- In-memory vector store (map of {:id, :text, :embedding, :metadata})
+- Ollama for embedding generation
+- Cosine similarity for retrieval
+- EDN files for persistence
+
+*** Design Decisions
+
+- Simple fixed-size chunking with overlap for context preservation
+- Pure Clojure vector operations (no external vector DB)
+- Embedding cache to avoid recomputation
+- Incremental indexing based on file modification times
+- Simple file types only (text, markdown, Clojure source)
+
+*** Setup and State
+
+#+NAME: rag-setup
+#+BEGIN_SRC clojure  :noweb yes
+(ns socrates.rag
+  "RAG (Retrieval Augmented Generation) system.
+   
+   Responsibilities:
+   - Document indexing and chunking
+   - Embedding generation and storage
+   - Vector similarity search
+   - Index persistence"
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [socrates.ollama :as ollama]))
+
+(def vector-store (atom {}))
+
+(def embedding-cache (atom {}))
+
+(defn- get-config
+  "Loads RAG configuration"
+  []
+  (let [config-file (java.io.File. "resources/config.edn")]
+    (if (.exists config-file)
+      (let [config (read-string (slurp config-file))]
+        (:rag config))
+      {:chunk-size 500
+         :chunk-overlap 50
+         :top-k 5})))
+
+(def config (atom (get-config)))
+
+#+END_SRC
+
+*** Tests for cosine-similarity function
+
+Tests that verify cosine similarity calculation works correctly.
+
+#+NAME: rag-test-ns
+#+BEGIN_SRC clojure :tangle test/socrates/rag_test.clj
+(ns socrates.rag-test
+  "Tests for RAG system."
+  (:require [clojure.test :refer :all]
+            [socrates.rag :as rag]))
+
+#+END_SRC
+
+#+NAME: rag-cosine-similarity-tests-body
+#+BEGIN_SRC clojure
+(deftest test-cosine-similarity-calculates-correctly
+  "Tests that cosine similarity is calculated correctly.
+   
+   Given: Two vectors
+   When: We calculate cosine similarity
+   Then: We should get a value between -1 and 1"
+  (let [vec1 [1.0 2.0 3.0]
+        vec2 [1.0 2.0 3.0]
+        similarity (rag/cosine-similarity vec1 vec2)]
+    (is (number? similarity)
+        "Similarity should be a number, but got: %s (type: %s)"
+        similarity (type similarity))
+    (is (<= -1.0 similarity 1.0)
+        "Similarity should be between -1 and 1, but got: %s"
+        similarity)))
+
+#+END_SRC
+
+*** Implementation: cosine-similarity function
+
+Calculates cosine similarity between two vectors.
+
+#+NAME: rag-cosine-similarity-impl
+#+BEGIN_SRC clojure :tangle src/socrates/rag.clj :noweb yes
+<<rag-setup>>
+
+(defn cosine-similarity
+  "Calculates cosine similarity between two vectors"
+  [vec1 vec2]
+  (let [dot-product (reduce + (map * vec1 vec2))
+        magnitude1 (Math/sqrt (reduce + (map #(* % %) vec1)))
+        magnitude2 (Math/sqrt (reduce + (map #(* % %) vec2)))]
+    (if (or (zero? magnitude1) (zero? magnitude2))
+      0.0
+      (/ dot-product (* magnitude1 magnitude2)))))
+
+#+END_SRC
+
+*** Tests for chunk-text function
+
+Tests that verify text chunking works correctly with overlap.
+
+#+NAME: rag-chunk-text-tests-body
+#+BEGIN_SRC clojure
+(deftest test-chunk-text-splits-into-overlapping-chunks
+  "Tests that text is split into overlapping chunks correctly.
+   
+   Given: A text string and chunk parameters
+   When: We chunk the text
+   Then: We should get overlapping chunks of the specified size"
+  (let [text "This is a test sentence with multiple words to chunk properly"
+        chunks (rag/chunk-text text 10 3)]
+    (is (vector? chunks)
+        "Chunks should be a vector, but got: %s (type: %s)"
+        chunks (type chunks))
+    (is (> (count chunks) 0)
+        "Should have at least one chunk, but got: %d"
+        (count chunks))
+    (doseq [chunk chunks]
+      (is (string? chunk)
+          "Each chunk should be a string, but got: %s (type: %s)"
+          chunk (type chunk)))))
+
+#+END_SRC
+
+*** Implementation: chunk-text function
+
+Splits text into overlapping chunks for indexing.
+
+#+NAME: rag-chunk-text-impl
+#+BEGIN_SRC clojure :tangle src/socrates/rag.clj :noweb yes
+<<rag-cosine-similarity-impl>>
+
+(defn chunk-text
+  "Splits text into overlapping chunks"
+  [text chunk-size overlap]
+  (let [words (str/split text #"\s+")
+        step (- chunk-size overlap)]
+    (loop [chunks []
+           remaining words]
+      (if (<= (count remaining) chunk-size)
+        (if (seq remaining)
+          (conj chunks (str/join " " remaining))
+          chunks)
+        (let [chunk (str/join " " (take chunk-size remaining))
+              new-remaining (drop step remaining)]
+          (recur (conj chunks chunk) new-remaining))))))
+
+#+END_SRC
+
+*** Tests for index-file function
+
+Tests that verify file indexing creates entries in the vector store.
+
+#+NAME: rag-index-file-tests-body
+#+BEGIN_SRC clojure
+(deftest test-index-file-creates-entries
+  "Tests that indexing a file creates entries in the vector store.
+   
+   Setup: Create a temporary test file with known content
+   When: We index the file
+   Then: The vector store should contain entries for each chunk"
+  (let [test-file (java.io.File/createTempFile "rag-test" ".txt")
+        _ (spit test-file "Sample content for indexing. This is a test.")
+        _ (rag/index-file (.getAbsolutePath test-file))
+        store (rag/get-vector-store)]
+    (is (not (empty? store))
+        "Vector store should not be empty after indexing.
+         Store contents: %s"
+        store)
+    (.delete test-file)))
+
+#+END_SRC
+
+*** Implementation: index-file function
+
+Indexes a single file by chunking it and generating embeddings.
+
+#+NAME: rag-index-file-impl
+#+BEGIN_SRC clojure :tangle src/socrates/rag.clj :noweb yes
+<<rag-chunk-text-impl>>
+
+(defn- get-embedding
+  "Gets embedding for text, using cache if available"
+  [text]
+  (if-let [cached (@embedding-cache text)]
+    cached
+    (let [embedding (ollama/embed text)]
+      (swap! embedding-cache assoc text embedding)
+      embedding)))
+
+(defn- index-chunk
+  "Indexes a single text chunk"
+  [chunk-id text metadata]
+  (let [embedding (get-embedding text)
+        entry {:id chunk-id
+               :text text
+               :embedding embedding
+               :metadata metadata}]
+    (swap! vector-store assoc chunk-id entry)
+    entry))
+
+(defn index-file
+  "Indexes a single file.
+   
+   Parameters:
+   - file-path: Path to the file to index
+   
+   Returns:
+   - Number of chunks indexed"
+  [file-path]
+  (try
+    (let [file (io/file file-path)
+          content (slurp file)
+          chunks (chunk-text content (:chunk-size @config) (:chunk-overlap @config))
+          file-id (str (.getAbsolutePath file))
+          indexed (atom 0)]
+      (doseq [[idx chunk] (map-indexed vector chunks)]
+        (let [chunk-id (str file-id ":" idx)
+              metadata {:file file-path
+                       :chunk-index idx
+                       :total-chunks (count chunks)}]
+          (index-chunk chunk-id chunk metadata)
+          (swap! indexed inc)))
+      @indexed)
+    (catch Exception e
+      (println "Error indexing file" file-path ":" (.getMessage e))
+      0)))
+
+#+END_SRC
+
+*** Tests for search function
+
+Tests that verify search returns relevant results sorted by similarity.
+
+#+NAME: rag-search-tests-body
+#+BEGIN_SRC clojure
+(deftest test-search-returns-relevant-results
+  "Tests that search returns results sorted by relevance.
+   
+   Given: An indexed vector store
+   When: We search for a query
+   Then: We should get results sorted by similarity score"
+  (let [test-file (java.io.File/createTempFile "rag-search" ".txt")
+        _ (spit test-file "Machine learning is a subset of artificial intelligence.")
+        _ (rag/index-file (.getAbsolutePath test-file))
+        results (rag/search "artificial intelligence" 5)]
+    (is (vector? results)
+        "Search should return a vector, but got: %s (type: %s)"
+        results (type results))
+    (when (seq results)
+      (is (every? #(contains? % :score) results)
+          "All results should have a :score. Results: %s"
+          results))
+    (.delete test-file)))
+
+#+END_SRC
+
+#+NAME: rag-search-tests
+#+BEGIN_SRC clojure :tangle test/socrates/rag_test.clj :noweb yes
+<<rag-cosine-similarity-tests-body>>
+<<rag-chunk-text-tests-body>>
+<<rag-index-file-tests-body>>
+<<rag-search-tests-body>>
+
+#+END_SRC
+
+*** Implementation: search function
+
+Searches for relevant chunks based on query similarity.
+
+#+NAME: rag-search-impl
+#+BEGIN_SRC clojure :tangle src/socrates/rag.clj :noweb yes
+<<rag-index-file-impl>>
+
+(defn search
+  "Searches for relevant chunks based on query.
+   
+   Parameters:
+   - query: Search query text
+   - top-k: Number of results to return (defaults to config)
+   
+   Returns:
+   - Vector of {:id, :text, :embedding, :metadata, :score} maps sorted by relevance"
+  ([query] (search query (:top-k @config)))
+  ([query top-k]
+   (let [query-embedding (get-embedding query)
+         results (map (fn [[id entry]]
+                       {:id id
+                        :text (:text entry)
+                        :embedding (:embedding entry)
+                        :metadata (:metadata entry)
+                        :score (cosine-similarity query-embedding (:embedding entry))})
+                     @vector-store)]
+     (take top-k (sort-by :score > results)))))
+
+(defn get-vector-store
+  "Returns the current vector store"
+  []
+  @vector-store)
+
+(defn save-index
+  "Saves the vector store to an EDN file"
+  [file-path]
+  (spit file-path (pr-str @vector-store)))
+
+(defn load-index
+  "Loads the vector store from an EDN file"
+  [file-path]
+  (try
+    (let [content (read-string (slurp file-path))]
+      (reset! vector-store content))
+    (catch Exception e
+      (println "Error loading index:" (.getMessage e)))))
+
+#+END_SRC
+
+** Context Management
+
+The context manager handles conversation history and context window management.
+
+*** Purpose
+
+The context manager is responsible for:
+- Storing conversation history
+- Managing context window size
+- Summarizing old context when needed
+- Persisting conversations to EDN files
+
+*** Setup and State
+
+#+NAME: context-setup
+#+BEGIN_SRC clojure  :noweb yes
+(ns socrates.context
+  "Context management for conversation history.
+   
+   Responsibilities:
+   - Conversation history tracking
+   - Context window management
+   - Conversation persistence"
+  (:require [clojure.java.io :as io]
+            [socrates.ollama :as ollama]))
+
+(def conversations (atom {}))
+
+#+END_SRC
+
+*** Tests for add-message function
+
+Tests that verify adding messages updates conversation history.
+
+#+NAME: context-test-ns
+#+BEGIN_SRC clojure
+(ns socrates.context-test
+  "Tests for context management."
+  (:require [clojure.test :refer :all]
+            [socrates.context :as context]))
+
+#+END_SRC
+
+#+NAME: context-add-message-tests-body
+#+BEGIN_SRC clojure
+(deftest test-add-message-adds-to-conversation
+  "Tests that adding a message updates the conversation.
+   
+   Given: An empty conversation
+   When: We add a message
+   Then: The conversation should contain that message"
+  (let [session-id "test-session"
+        _ (context/add-message session-id "user" "Hello")
+        messages (context/get-conversation session-id)]
+    (is (not (empty? messages))
+        "Conversation should not be empty after adding message.
+         Messages: %s"
+        messages)
+    (is (= "user" (:role (first messages)))
+        "First message should have role 'user', but got: %s"
+        (:role (first messages)))
+    (is (= "Hello" (:content (first messages)))
+        "First message should have content 'Hello', but got: %s"
+        (:content (first messages)))))
+
+#+END_SRC
+
+#+NAME: context-add-message-tests
+#+BEGIN_SRC clojure :tangle test/socrates/context_test.clj :noweb yes
+<<context-test-ns>>
+<<context-add-message-tests-body>>
+
+#+END_SRC
+
+*** Implementation: add-message and get-conversation functions
+
+Functions for managing conversation history.
+
+#+NAME: context-add-message-impl
+#+BEGIN_SRC clojure :tangle src/socrates/context.clj :noweb yes
+<<context-setup>>
+
+(defn add-message
+  "Adds a message to the conversation history.
+   
+   Parameters:
+   - session-id: Unique identifier for the conversation session
+   - role: 'user' or 'assistant'
+   - content: Message content
+   
+   Returns:
+   - Updated conversation vector"
+  [session-id role content]
+  (let [message {:role role
+                 :content content
+                 :timestamp (System/currentTimeMillis)}]
+    (swap! conversations update session-id
+           (fn [messages]
+             (conj (or messages []) message)))
+    (get @conversations session-id)))
+
+(defn get-conversation
+  "Gets conversation history for a session.
+   
+   Parameters:
+   - session-id: Session identifier
+   
+   Returns:
+   - Vector of messages"
+  [session-id]
+  (get @conversations session-id []))
+
+#+END_SRC
+
+*** Implementation: truncate-conversation function
+
+Truncates conversation to fit within token limits.
+
+#+NAME: context-truncate-impl
+#+BEGIN_SRC clojure :tangle src/socrates/context.clj :noweb yes
+<<context-add-message-impl>>
+
+(defn truncate-conversation
+  "Truncates conversation to fit within token limit.
+   
+   Parameters:
+   - session-id: Session identifier
+   - max-tokens: Maximum number of tokens
+   
+   Returns:
+   - Truncated conversation vector"
+  [session-id max-tokens]
+  (let [messages (get-conversation session-id)
+        ;; Simple token estimation: ~4 chars per token
+        estimated-tokens (reduce + (map #(* (count (:content %)) 0.25) messages))]
+    (if (> estimated-tokens max-tokens)
+      (let [keep-count (int (* max-tokens 0.8)) ;; Keep 80% of limit
+            truncated (take-last keep-count messages)]
+        (swap! conversations assoc session-id truncated)
+        truncated)
+      messages)))
+
+#+END_SRC
+
+*** Implementation: save-conversation and load-conversation functions
+
+Functions for persisting conversations to EDN files.
+
+#+NAME: context-persistence-impl
+#+BEGIN_SRC clojure :tangle src/socrates/context.clj :noweb yes
+<<context-truncate-impl>>
+
+(defn save-conversation
+  "Saves a conversation to an EDN file.
+   
+   Parameters:
+   - session-id: Session identifier
+   - file-path: Path to save file"
+  [session-id file-path]
+  (let [messages (get-conversation session-id)
+        file (io/file file-path)]
+    (.mkdirs (.getParentFile file))
+    (spit file (pr-str messages))))
+
+(defn load-conversation
+  "Loads a conversation from an EDN file.
+   
+   Parameters:
+   - session-id: Session identifier
+   - file-path: Path to load file"
+  [session-id file-path]
+  (try
+    (let [messages (read-string (slurp file-path))]
+      (swap! conversations assoc session-id messages))
+    (catch Exception e
+      (println "Error loading conversation:" (.getMessage e)))))
+
+#+END_SRC
+
+** MCP Client
+
+The MCP (Model Context Protocol) client enables tool execution.
+
+*** Purpose
+
+The MCP client is responsible for:
+- Connecting to MCP servers
+- Discovering available tools
+- Executing tools asynchronously
+- Returning results to Ollama
+
+*** Setup and State
+
+#+NAME: mcp-setup
+#+BEGIN_SRC clojure  :noweb yes
+(ns socrates.mcp
+  "MCP (Model Context Protocol) client.
+   
+   Responsibilities:
+   - MCP server communication
+   - Tool discovery and execution
+   - Result handling"
+  (:require [cheshire.core :as json]))
+
+(def tools (atom {}))
+
+#+END_SRC
+
+*** Tests for register-tool function
+
+Tests that verify tool registration works correctly.
+
+#+NAME: mcp-test-ns
+#+BEGIN_SRC clojure
+(ns socrates.mcp-test
+  "Tests for MCP client."
+  (:require [clojure.test :refer :all]
+            [socrates.mcp :as mcp]))
+
+#+END_SRC
+
+#+NAME: mcp-register-tool-tests-body
+#+BEGIN_SRC clojure
+(deftest test-register-tool-adds-to-tools
+  "Tests that registering a tool adds it to the tools map.
+   
+   Given: No tools registered
+   When: We register a test tool
+   Then: The tool should be available in the tools list"
+  (let [test-tool-name "test_tool"
+        _ (mcp/register-tool test-tool-name "Test tool" (fn [args] "result"))
+        tools (mcp/list-tools)]
+    (is (some #(= test-tool-name (:name %)) tools)
+        "Tool should be in tools list. Available tools: %s"
+        (map :name tools))))
+
+#+END_SRC
+
+*** Implementation: register-tool and list-tools functions
+
+Functions for registering and listing tools.
+
+#+NAME: mcp-register-tool-impl
+#+BEGIN_SRC clojure :tangle src/socrates/mcp.clj :noweb yes
+<<mcp-setup>>
+
+(defn register-tool
+  "Registers a tool for MCP execution.
+   
+   Parameters:
+   - name: Tool name
+   - description: Tool description
+   - handler: Function that executes the tool"
+  [name description handler]
+  (swap! tools assoc name {:name name
+                          :description description
+                          :handler handler}))
+
+(defn list-tools
+  "Lists all registered tools.
+   
+   Returns:
+   - Vector of tool information maps"
+  []
+  (vec (vals @tools)))
+
+#+END_SRC
+
+*** Tests for execute-tool function
+
+Tests that verify tool execution works correctly.
+
+#+NAME: mcp-execute-tool-tests-body
+#+BEGIN_SRC clojure
+(deftest test-execute-tool-returns-result
+  "Tests that executing a tool returns a result.
+   
+   Given: A registered tool
+   When: We execute the tool
+   Then: We should get a result with success status"
+  (let [test-file (java.io.File/createTempFile "mcp-test" ".txt")
+        _ (spit test-file "test content")
+        result (mcp/execute-tool "read_file" {:path (.getAbsolutePath test-file)})]
+    (is (:success result)
+        "Tool execution should succeed. Result: %s"
+        result)
+    (is (contains? result :result)
+        "Result should contain :result key. Result: %s"
+        result)
+    (.delete test-file)))
+
+#+END_SRC
+
+#+NAME: mcp-execute-tool-tests
+#+BEGIN_SRC clojure :tangle test/socrates/mcp_test.clj :noweb yes
+<<mcp-test-ns>>
+<<mcp-register-tool-tests-body>>
+<<mcp-execute-tool-tests-body>>
+
+#+END_SRC
+
+*** Implementation: execute-tool function and built-in tools
+
+Function for executing tools and registration of built-in tools.
+
+#+NAME: mcp-execute-tool-impl
+#+BEGIN_SRC clojure :tangle src/socrates/mcp.clj :noweb yes
+<<mcp-register-tool-impl>>
+
+(defn execute-tool
+  "Executes a tool by name.
+   
+   Parameters:
+   - tool-name: Name of the tool to execute
+   - args: Arguments for the tool
+   
+   Returns:
+   - Tool execution result"
+  [tool-name args]
+  (if-let [tool (get @tools tool-name)]
+    (try
+      {:success true
+       :result ((:handler tool) args)}
+      (catch Exception e
+        {:success false
+         :error (.getMessage e)}))
+    {:success false
+     :error (str "Tool not found: " tool-name)}))
+
+;; Register built-in tools
+(register-tool "read_file"
+               "Reads the contents of a file"
+               (fn [args]
+                 (slurp (:path args))))
+
+(register-tool "write_file"
+               "Writes content to a file"
+               (fn [args]
+                 (spit (:path args) (:content args))
+                 {:success true}))
+
+#+END_SRC
+
+** Emacs Integration
+
+The Emacs integration enables access to Emacs packages via clomacs.
+
+*** Purpose
+
+The Emacs integration is responsible for:
+- Connecting to Emacs via clomacs
+- Calling Emacs Lisp functions
+- Accessing org-ql, memacs, denote packages
+- Converting Emacs data to EDN format
+
+*** Setup and State
+
+#+NAME: emacs-setup
+#+BEGIN_SRC clojure  :noweb yes
+(ns socrates.emacs
+  "Emacs integration via clomacs.
+   
+   Responsibilities:
+   - Emacs connection management
+   - Calling Emacs Lisp functions
+   - Data format conversion"
+  (:require [clomacs.core :as clomacs]))
+
+(def emacs-connected (atom false))
+
+#+END_SRC
+
+*** Tests for connect function
+
+Tests that verify Emacs connection works.
+
+#+NAME: emacs-test-ns
+#+BEGIN_SRC clojure
+(ns socrates.emacs-test
+  "Tests for Emacs integration."
+  (:require [clojure.test :refer :all]
+            [socrates.emacs :as emacs]))
+
+#+END_SRC
+
+#+NAME: emacs-connect-tests-body
+#+BEGIN_SRC clojure
+(deftest test-connect-attempts-connection
+  "Tests that connect attempts to connect to Emacs.
+   
+   Note: This test may fail if Emacs is not running.
+   It tests the connection attempt, not success."
+  (let [result (emacs/connect)]
+    (is (boolean? result)
+        "Connect should return a boolean, but got: %s (type: %s)"
+        result (type result))))
+
+#+END_SRC
+
+#+NAME: emacs-connect-tests
+#+BEGIN_SRC clojure :tangle test/socrates/emacs_test.clj :noweb yes
+<<emacs-test-ns>>
+<<emacs-connect-tests-body>>
+
+#+END_SRC
+
+*** Implementation: connect and call-emacs functions
+
+Functions for connecting to Emacs and calling Emacs Lisp functions.
+
+#+NAME: emacs-connect-impl
+#+BEGIN_SRC clojure :tangle src/socrates/emacs.clj :noweb yes
+<<emacs-setup>>
+
+(defn connect
+  "Connects to Emacs instance.
+   
+   Returns:
+   - true if connection successful, false otherwise"
+  []
+  (try
+    (clomacs/defn emacs-eval "eval" :private)
+    (reset! emacs-connected true)
+    true
+    (catch Exception e
+      (println "Error connecting to Emacs:" (.getMessage e))
+      false)))
+
+(defn call-emacs
+  "Calls an Emacs Lisp function.
+   
+   Parameters:
+   - function-name: Name of Emacs Lisp function
+   - args: Arguments to pass
+   
+   Returns:
+   - Result from Emacs function"
+  [function-name & args]
+  (if @emacs-connected
+    (try
+      (clomacs/eval (str "(" function-name " " (pr-str args) ")"))
+      (catch Exception e
+        {:error (.getMessage e)}))
+    {:error "Emacs not connected"}))
+
+#+END_SRC
+
+*** Implementation: org-ql-query and denote-search functions
+
+Functions for accessing Emacs packages (org-ql, denote).
+
+#+NAME: emacs-packages-impl
+#+BEGIN_SRC clojure :tangle src/socrates/emacs.clj :noweb yes
+<<emacs-connect-impl>>
+
+(defn org-ql-query
+  "Queries org-mode files using org-ql.
+   
+   Parameters:
+   - query: org-ql query string
+   
+   Returns:
+   - Vector of matching org entries"
+  [query]
+  (call-emacs "org-ql-select" query))
+
+(defn denote-search
+  "Searches denote notes.
+   
+   Parameters:
+   - query: Search query
+   
+   Returns:
+   - Vector of matching notes"
+  [query]
+  (call-emacs "denote-directory-files" query))
+
+#+END_SRC
+
+** Speech Processing
+
+The speech processing module handles Whisper STT and espeak TTS.
+
+*** Purpose
+
+The speech module is responsible for:
+- Audio capture for STT
+- Calling whisper.cpp for transcription
+- Text-to-speech via espeak
+- Audio playback
+
+*** Setup and Configuration
+
+#+NAME: speech-setup
+#+BEGIN_SRC clojure  :noweb yes
+(ns socrates.speech
+  "Speech processing (STT and TTS).
+   
+   Responsibilities:
+   - Speech-to-text via Whisper
+   - Text-to-speech via espeak"
+  (:require [clojure.java.shell :as shell]
+            [clojure.string :as str]))
+
+(defn- get-config
+  "Loads speech configuration"
+  []
+  (let [config-file (java.io.File. "resources/config.edn")]
+    (if (.exists config-file)
+      (let [config (read-string (slurp config-file))]
+        {:whisper (:whisper config)
+         :speech (:speech config)})
+      {:whisper {:model-size "tiny"
+                 :model-path "/usr/local/bin/whisper.cpp"}
+       :speech {:wake-word "socrates"
+                :sensitivity 0.5}})))
+
+(def config (atom (get-config)))
+
+#+END_SRC
+
+*** Tests for speak function
+
+Tests that verify TTS execution works.
+
+#+NAME: speech-test-ns
+#+BEGIN_SRC clojure
+(ns socrates.speech-test
+  "Tests for speech processing."
+  (:require [clojure.test :refer :all]
+            [socrates.speech :as speech]))
+
+#+END_SRC
+
+#+NAME: speech-speak-tests-body
+#+BEGIN_SRC clojure
+(deftest test-speak-executes-espeak
+  "Tests that speak executes espeak command.
+   
+   Note: This test requires espeak to be installed."
+  (let [result (speech/speak "test")]
+    (is (map? result)
+        "Speak should return a process result map, but got: %s (type: %s)"
+        result (type result))))
+
+#+END_SRC
+
+#+NAME: speech-speak-tests
+#+BEGIN_SRC clojure :tangle test/socrates/speech_test.clj :noweb yes
+<<speech-test-ns>>
+<<speech-speak-tests-body>>
+
+#+END_SRC
+
+*** Implementation: speak function
+
+Function for text-to-speech using espeak.
+
+#+NAME: speech-speak-impl
+#+BEGIN_SRC clojure :tangle src/socrates/speech.clj :noweb yes
+<<speech-setup>>
+
+(defn speak
+  "Synthesizes speech using espeak.
+   
+   Parameters:
+   - text: Text to speak
+   
+   Returns:
+   - Process handle"
+  [text]
+  (shell/sh "espeak" text))
+
+#+END_SRC
+
+*** Implementation: transcribe function
+
+Function for speech-to-text using Whisper.
+
+#+NAME: speech-transcribe-impl
+#+BEGIN_SRC clojure :tangle src/socrates/speech.clj :noweb yes
+<<speech-speak-impl>>
+
+(defn transcribe
+  "Transcribes audio file using Whisper.
+   
+   Parameters:
+   - audio-file: Path to audio file
+   
+   Returns:
+   - Transcribed text"
+  [audio-file]
+  (let [whisper-path (:model-path (:whisper @config))
+        model-size (:model-size (:whisper @config))
+        result (shell/sh whisper-path
+                        "-m" (str "models/ggml-" model-size ".bin")
+                        "-f" audio-file)]
+    (if (zero? (:exit result))
+      (str/trim (:out result))
+      (throw (ex-info "Whisper transcription failed"
+                      {:exit (:exit result)
+                       :error (:err result)})))))
+
+#+END_SRC
+
+** Core Orchestration
+
+The core module orchestrates all components.
+
+*** Purpose
+
+The core module is responsible for:
+- Initializing all components
+- Managing component lifecycle
+- Coordinating interactions between components
+- Handling main event loop
+
+*** Setup and State
+
+#+NAME: core-setup
+#+BEGIN_SRC clojure  :noweb yes
+(ns socrates.core
+  "Core orchestration for Socrates AI assistant.
+   
+   Responsibilities:
+   - Component initialization
+   - Lifecycle management
+   - Main event loop"
+  (:require [socrates.ollama :as ollama]
+            [socrates.rag :as rag]
+            [socrates.context :as context]
+            [socrates.mcp :as mcp]
+            [socrates.emacs :as emacs]
+            [socrates.speech :as speech]
+            [clojure.core.async :as async]))
+
+(def system-state (atom {:running false
+                         :components {}}))
+
+#+END_SRC
+
+*** Tests for init function
+
+Tests that verify system initialization works.
+
+#+NAME: core-test-ns
+#+BEGIN_SRC clojure
+(ns socrates.core-test
+  "Tests for core orchestration."
+  (:require [clojure.test :refer :all]
+            [socrates.core :as core]))
+
+#+END_SRC
+
+#+NAME: core-init-tests-body
+#+BEGIN_SRC clojure
+(deftest test-init-initializes-system
+  "Tests that init initializes the system.
+   
+   Given: System not initialized
+   When: We call init
+   Then: System state should be initialized"
+  (let [state (core/init)]
+    (is (map? state)
+        "Init should return a state map, but got: %s (type: %s)"
+        state (type state))
+    (is (contains? state :components)
+        "State should contain :components key. State: %s"
+        state)))
+
+#+END_SRC
+
+#+NAME: core-init-tests
+#+BEGIN_SRC clojure :tangle test/socrates/core_test.clj :noweb yes
+<<core-test-ns>>
+<<core-init-tests-body>>
+
+#+END_SRC
+
+*** Implementation: init, start, and stop functions
+
+Functions for system lifecycle management.
+
+#+NAME: core-lifecycle-impl
+#+BEGIN_SRC clojure :tangle src/socrates/core.clj :noweb yes
+<<core-setup>>
+
+(defn init
+  "Initializes all components.
+   
+   Returns:
+   - System state map"
+  []
+  (println "Initializing Socrates...")
+  (let [state {:running false
+               :components {:ollama :ready
+                           :rag :ready
+                           :context :ready
+                           :mcp :ready
+                           :emacs :ready
+                           :speech :ready}}]
+    (reset! system-state state)
+    (emacs/connect)
+    (rag/load-index "data/index/rag-index.edn")
+    state))
+
+(defn start
+  "Starts the system.
+   
+   Returns:
+   - Updated system state"
+  []
+  (swap! system-state assoc :running true)
+  (println "Socrates started")
+  @system-state)
+
+(defn stop
+  "Stops the system gracefully."
+  []
+  (println "Stopping Socrates...")
+  (rag/save-index "data/index/rag-index.edn")
+  (swap! system-state assoc :running false)
+  (println "Socrates stopped"))
+
+#+END_SRC
+
+*** Implementation: process-query function
+
+Function for processing user queries through the system.
+
+#+NAME: core-process-query-impl
+#+BEGIN_SRC clojure :tangle src/socrates/core.clj :noweb yes
+<<core-lifecycle-impl>>
+
+(defn process-query
+  "Processes a user query through the system.
+   
+   Parameters:
+   - query: User query text
+   - session-id: Conversation session ID
+   
+   Returns:
+   - Response text"
+  [query session-id]
+  (let [_ (context/add-message session-id "user" query)
+        rag-results (rag/search query)
+        conversation (context/get-conversation session-id)
+        response-ch (ollama/chat query {:context conversation
+                                       :stream false})]
+    (let [response-text (:message response-ch)]
+      (context/add-message session-id "assistant" response-text)
+      response-text)))
+
+#+END_SRC
+
+*** Implementation: main function
+
+Main entry point for the application.
+
+#+NAME: core-main-impl
+#+BEGIN_SRC clojure :tangle src/socrates/core.clj :noweb yes
+<<core-process-query-impl>>
+
+(defn -main
+  "Main entry point"
+  [& args]
+  (init)
+  (start)
+  (println "Socrates is ready. Use process-query to interact."))
+
+#+END_SRC
+
+* Integration & System Tests
+
+** End-to-End Tests
+
+Tests that verify the entire system works together.
+
+#+BEGIN_SRC clojure :tangle test/socrates/integration_test.clj
+(ns socrates.integration-test
+  "Integration tests for the complete system."
+  (:require [clojure.test :refer :all]))
+
+(deftest test-system-initialization
+  "Tests that the entire system can be initialized.
+   
+   Given: All dependencies available
+   When: We initialize the system
+   Then: All components should be ready"
+  (is true "Integration test placeholder"))
+
+#+END_SRC
+

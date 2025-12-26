@@ -1,0 +1,8 @@
+{:paths ["src" "test"]
+ :deps {org.clojure/clojure {:mvn/version "1.11.1"}
+        http-kit/http-kit {:mvn/version "2.7.0"}
+        cheshire/cheshire {:mvn/version "5.11.0"}
+        org.clojure/core.async {:mvn/version "1.6.673"}}
+ :aliases {:test {:extra-paths ["test"]
+                  :extra-deps {org.clojure/clojure {:mvn/version "1.11.1"}}}}
+}

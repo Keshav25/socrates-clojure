@@ -1,0 +1,72 @@
+#+TITLE: Socrates Clojure AI Assistant
+#+AUTHOR: Kesh
+#+DATE: 2025-12-26
+
+* Introduction
+
+Socrates is a minimal viable AI assistant built in Clojure using literate programming.
+It acts as a Personal Data Assistant (PDA) with access to your Emacs knowledge base
+through clomacs integration.
+
+* Features
+
+- Speech input via Whisper (whisper.cpp)
+- Speech output via espeak
+- Ollama integration for LLM capabilities
+- RAG system for document retrieval
+- MCP client for tool execution
+- Emacs integration (org-ql, memacs, denote) via clomacs
+- Context management for conversation history
+
+* Requirements
+
+- Clojure (via clj or lein)
+- Ollama running locally
+- whisper.cpp installed (optional, for STT)
+- espeak installed (optional, for TTS)
+- Emacs with clomacs (optional, for Emacs integration)
+
+* Installation
+
+1. Clone or download this repository
+2. Install dependencies:
+   #+BEGIN_SRC shell
+   clj -M:test
+   #+END_SRC
+
+3. Configure in =resources/config.edn=
+
+* Usage
+
+** Development
+
+The system is developed as a literate program in =socrates.org=.
+
+To work with the code:
+
+1. Open =socrates.org= in Emacs
+2. Execute code blocks with =C-c C-c=
+3. Tangle source files with =C-c C-v t=
+4. Run tests with =clj -M:test=
+
+** Running the System
+
+#+BEGIN_SRC shell
+clj -M -m socrates.core
+#+END_SRC
+
+* Architecture
+
+See =socrates.org= for complete architecture documentation.
+
+* Development Approach
+
+- Literate programming (org-mode with org-babel)
+- TDD + TCR hybrid approach
+- Comprehensive documentation alongside code
+- Self-documenting tests with full context
+
+* License
+
+Open source - use as you wish.
+
